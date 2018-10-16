@@ -11,7 +11,7 @@
   </description>
 
   <releases>
-      <release version="0.9.0" date="2018-10-10">
+      <release version="0.9.1" date="2018-10-10">
           <description>
               <p>Improved UI and make app ready for Juno</p>
               <ul>
