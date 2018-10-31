@@ -11,6 +11,20 @@
   </description>
 
   <releases>
+      <release version="0.9.3" date="2018-10-31">
+          <description>
+              <p>Easier navigation across themes and icons</p>
+              <ul>
+                  <li>New "All" theme that includes all icons in the system.</li>
+                  <li>Easy comparison of the same icon across different themes.</li>
+                  <li>Allow to change the background color.</li>
+                  <li>Mark the selected icon.</li>
+                  <li>Improved reliability and performance.</li>
+                  <li>Convert text to path in Iconoscope's icon.</li>
+              </ul>
+          </description>
+      </release>
+
       <release version="0.9.1" date="2018-10-10">
           <description>
               <p>Improved UI and make app ready for Juno</p>
