@@ -1,8 +1,77 @@
+#include <locale.h>
 #include <cairo.h>
 #include <gtk/gtk.h>
 
 #include "common.h"
+#include "slo_timers.h"
 #include "gtk_utils.c"
+#include "fk_paned.c"
+#include "fk_list_box.c"
+
+struct app_t app;
+void app_set_selected_theme (struct app_t *app, const char *theme_name, const char *selected_icon);
+
+#include "icon_view.h"
+
+// TODO: Support svgz extension (at least Kdenlive uses it). Because GtkImage
+// doesn't understand them (yet), we may need to call gzip.
+// NOTE: The order here defines the priority, from highest to lowest.
+#define VALID_EXTENSIONS \
+    EXTENSION(EXT_SVG, ".svg") \
+    EXTENSION(EXT_SYMBOLIC_PNG, ".symbolic.png") \
+    EXTENSION(EXT_PNG, ".png") \
+    EXTENSION(EXT_XPM, ".xpm")
+
+enum valid_extensions {
+#define EXTENSION(name,str) name,
+    VALID_EXTENSIONS
+#undef EXTENSION
+    NUM_EXTENSIONS
+};
+
+struct icon_theme_t {
+    mem_pool_t pool;
+
+    char *name;
+    uint32_t num_dirs;
+    char **dirs;
+    char *index_file;
+    char *dir_name;
+
+    GHashTable *icon_names;
+
+    struct icon_theme_t *next;
+};
+
+struct app_t {
+    // App state
+    struct icon_theme_t *selected_theme;
+    bool all_theme_selected;
+    char *selected_icon;
+    dvec4 bg_color;
+
+    GtkWidget *icon_list;
+    GtkWidget *search_entry;
+    GtkWidget *icon_view_widget;
+    GtkWidget *theme_selector;
+
+    // Special (fake) "All" theme
+    mem_pool_t all_icon_names_pool;
+    GTree *all_icon_names;
+    GtkWidget *all_icon_names_widget;
+    const char *all_icon_names_first;
+    struct fk_list_box_t fk_list_box;
+
+    // Linked list head for all themes
+    struct icon_theme_t *themes;
+
+    // Icon view for the selected icon
+    mem_pool_t icon_view_pool;
+    struct icon_view_t icon_view;
+
+    const char* valid_extensions[NUM_EXTENSIONS];
+};
+
 #include "icon_view.c"
 
 static inline
@@ -157,18 +226,14 @@ bool read_dir (DIR *dirp, struct dirent **res)
 
 // NOTE: If multiple icons are found, ties are broken according to the order in
 // valid_extensions.
-// TODO: Support svgz extension (at least Kdenlive uses it). Because GtkImage
-// doesn't understand them (yet), we may need to call gzip.
-const char* valid_extensions[] = {".svg", ".symbolic.png", ".png", ".xpm"};
-
 bool fname_has_valid_extension (char *fname, size_t *icon_name_len)
 {
     bool ret = false;
     size_t len = strlen (fname);
-    for (int i=0; i<ARRAY_SIZE(valid_extensions); i++) {
-        if (g_str_has_suffix(fname, valid_extensions[i])) {
+    for (int i=0; i<ARRAY_SIZE(app.valid_extensions); i++) {
+        if (g_str_has_suffix(fname, app.valid_extensions[i])) {
             if (icon_name_len != NULL) {
-                len -= strlen (valid_extensions[i]);
+                len -= strlen (app.valid_extensions[i]);
             }
             ret = true;
             break;
@@ -198,8 +263,8 @@ bool icon_lookup (mem_pool_t *pool, char *dir, const char *icon_name, char **fou
         string_t icon_name_str = str_new(icon_name);
         uint32_t icon_name_len = str_len(&icon_name_str);
 
-        for (int i=0; i<ARRAY_SIZE(valid_extensions); i++) {
-            str_put_c (&icon_name_str, icon_name_len, valid_extensions[i]);
+        for (int i=0; i<ARRAY_SIZE(app.valid_extensions); i++) {
+            str_put_c (&icon_name_str, icon_name_len, app.valid_extensions[i]);
             if (strcmp (str_data(&icon_name_str), entry_info->d_name) == 0) {
                 ext_id = i;
             }
@@ -218,7 +283,7 @@ bool icon_lookup (mem_pool_t *pool, char *dir, const char *icon_name, char **fou
             str_cat_c (&found_path, "/");
         }
         str_cat_c (&found_path, icon_name);
-        str_cat_c (&found_path, valid_extensions[ext_id]);
+        str_cat_c (&found_path, app.valid_extensions[ext_id]);
 
         *found_file = mem_pool_push_size (pool, str_len(&found_path) + 1);
         memcpy (*found_file, str_data(&found_path), str_len(&found_path) + 1);
@@ -253,15 +318,9 @@ bool file_lookup (char *dir, char *file)
     return res;
 }
 
-struct icon_theme_t {
-    char *name;
-    uint32_t num_dirs;
-    char **dirs;
-    char *index_file;
-    char *dir_name;
-};
+templ_sort_ll(icon_theme_sort, struct icon_theme_t, strcasecmp((*a)->name, (*b)->name) < 0)
 
-void set_theme_name (mem_pool_t *pool, struct icon_theme_t *theme)
+void set_theme_name (struct icon_theme_t *theme)
 {
     char *c = theme->index_file;
 
@@ -275,7 +334,7 @@ void set_theme_name (mem_pool_t *pool, struct icon_theme_t *theme)
         uint32_t key_len, value_len;
         c = seek_next_key_value (c, &key, &key_len, &value, &value_len);
         if (strlen (name_str) == key_len && strncmp (name_str, key, key_len) == 0) {
-            theme->name = pom_push_size (pool, value_len+1);
+            theme->name = pom_push_size (&theme->pool, value_len+1);
             memcpy (theme->name, value, value_len);
             theme->name[value_len] = '\0';
         }
@@ -283,197 +342,23 @@ void set_theme_name (mem_pool_t *pool, struct icon_theme_t *theme)
     }
 }
 
-struct it_da_t {
-    struct icon_theme_t *data;
-    uint32_t len;
-    uint32_t capacity;
-};
-
-void it_da_append (struct it_da_t *arr, struct icon_theme_t *e)
+struct icon_theme_t* app_icon_theme_new (struct app_t *app)
 {
-    if (arr->capacity == 0) {
-        arr->capacity = 10;
-        arr->data = malloc (arr->capacity * sizeof (struct icon_theme_t));
+    mem_pool_t bootstrap = {0};
+    struct icon_theme_t *new_icon_theme = mem_pool_push_size (&bootstrap, sizeof(struct icon_theme_t));
+    *new_icon_theme = ZERO_INIT (struct icon_theme_t);
+    new_icon_theme->pool = bootstrap;
 
-    } else if (arr->len + 1 == arr->capacity) {
-        arr->capacity *= 2;
-        struct icon_theme_t *tmp = realloc (arr->data, arr->capacity*sizeof (struct icon_theme_t));
-        if (tmp == NULL) {
-            printf ("Realloc failed.\n");
-        } else {
-            arr->data = tmp;
-        }
-    }
-
-    arr->data[arr->len] = *e;
-    arr->len++;
+    new_icon_theme->next = app->themes;
+    app->themes = new_icon_theme;
+    return new_icon_theme;
 }
 
-void it_da_free (struct it_da_t *arr)
+void icon_theme_destroy (struct icon_theme_t *icon_theme)
 {
-    free (arr->data);
-}
-
-gboolean delete_callback (GtkWidget *widget, GdkEvent *event, gpointer user_data)
-{
-    gtk_main_quit ();
-    return FALSE;
-}
-
-void get_all_icon_themes (mem_pool_t *pool, struct icon_theme_t **themes, uint32_t *num_themes)
-{
-    GtkIconTheme *icon_theme = gtk_icon_theme_get_default ();
-    gchar **path;
-    gint num_paths;
-    gtk_icon_theme_get_search_path (icon_theme, &path, &num_paths);
-
-    // Locate all index.theme files that are in the search paths, and append a
-    // new icon_theme_t struct for each one.
-    struct it_da_t themes_arr = {0};
-    int i;
-    for (i=0; i<num_paths; i++) {
-        char *curr_search_path = path[i];
-        string_t path_str = str_new (curr_search_path);
-        if (str_last(&path_str) != '/') {
-            str_cat_c (&path_str, "/");
-        }
-        uint32_t path_len = str_len (&path_str);
-
-        struct stat st;
-        if (stat(curr_search_path, &st) == -1 && errno == ENOENT) {
-            // NOTE: Current search paths may contain non existent directories.
-            //printf ("Search path does not exist.\n");
-            continue;
-        }
-
-        DIR *d = opendir (curr_search_path);
-        struct dirent *entry_info;
-        while (read_dir (d, &entry_info)) {
-            if (strcmp ("default", entry_info->d_name) == 0) {
-                continue;
-            } else if (entry_info->d_name[0] != '.') {
-                string_t theme_dir = str_new (entry_info->d_name);
-                str_put (&path_str, path_len, &theme_dir);
-
-                if (stat(str_data(&path_str), &st) == 0 && S_ISDIR(st.st_mode) &&
-                    file_lookup (str_data(&path_str), "index.theme")) {
-
-                    struct icon_theme_t theme;
-                    theme.dir_name = pom_push_size (pool, strlen(entry_info->d_name)+1);
-                    memcpy (theme.dir_name, entry_info->d_name, strlen(entry_info->d_name)+1);
-
-                    str_cat_c (&path_str, "/index.theme");
-                    theme.index_file = full_file_read (pool, str_data(&path_str));
-                    set_theme_name(pool, &theme);
-                    it_da_append (&themes_arr, &theme);
-                }
-                str_free (&theme_dir);
-            }
-        }
-
-        closedir (d);
-        str_free (&path_str);
-    }
-
-    // A theme can be spread across multiple search paths. Now that we know the
-    // internal name for each theme, we look for subdirectories with this
-    // internal name to know which directories a theme is spread across.
-    for (i=0; i<themes_arr.len; i++) {
-        struct icon_theme_t *curr_theme = &themes_arr.data[i];
-
-        char *found_dirs[num_paths];
-        uint32_t num_found = 0;
-        int j;
-        for (j=0; j<num_paths; j++) {
-            char *curr_search_path = path[j];
-            string_t path_str = str_new (curr_search_path);
-            if (str_last(&path_str) != '/') {
-                str_cat_c (&path_str, "/");
-            }
-            str_cat_c (&path_str, curr_theme->dir_name);
-
-            struct stat st;
-            if (stat(str_data(&path_str), &st) == 0 && S_ISDIR(st.st_mode)) {
-                found_dirs[num_found] = (char*)pom_push_size (pool, str_len(&path_str)+1);
-                memcpy (found_dirs[num_found], str_data(&path_str), str_len(&path_str)+1);
-                num_found++;
-            }
-            str_free (&path_str);
-        }
-
-        curr_theme->dirs = (char**)pom_push_size (pool, sizeof(char*)*num_found);
-        memcpy (curr_theme->dirs, found_dirs, sizeof(char*)*num_found);
-        curr_theme->num_dirs = num_found;
-    }
-
-    // Unthemed icons are found inside search path directories but not in a
-    // directory. For these icons we add a zero initialized theme, and set as
-    // dirs all search paths with icons in them.
-    //
-    // NOTE: Search paths are not explored recursiveley for icons.
-    struct icon_theme_t no_theme = {0};
-    no_theme.name = "None";
-
-    char *found_dirs[num_paths];
-    uint32_t num_found = 0;
-    for (i=0; i<num_paths; i++) {
-        string_t path_str = str_new (path[i]);
-        if (str_last(&path_str) != '/') {
-            str_cat_c (&path_str, "/");
-        }
-        uint32_t path_len = str_len (&path_str);
-
-        struct stat st;
-        if (stat(str_data(&path_str), &st) == -1 && errno == ENOENT) {
-            // NOTE: Current search paths may contain non existent directories.
-            //printf ("Search path does not exist.\n");
-            continue;
-        }
-
-        DIR *d = opendir (str_data(&path_str));
-        struct dirent *entry_info;
-        while (read_dir (d, &entry_info)) {
-            str_put_c (&path_str, path_len, entry_info->d_name);
-
-            if (stat(str_data(&path_str), &st) == 0 && S_ISREG(st.st_mode)) {
-                if (fname_has_valid_extension (entry_info->d_name, NULL)) {
-                    uint32_t res_len = strlen (path[i]) + 1;
-                    found_dirs[num_found] = (char*)pom_push_size (pool, res_len);
-                    memcpy (found_dirs[num_found], path[i], res_len);
-                    num_found++;
-                    break;
-                }
-            }
-        }
-        str_free (&path_str);
-        closedir (d);
-    }
-
-    no_theme.dirs = (char**)pom_push_size (pool, sizeof(char*)*num_found);
-    memcpy (no_theme.dirs, found_dirs, sizeof(char*)*num_found);
-    no_theme.num_dirs = num_found;
-    it_da_append (&themes_arr, &no_theme);
-
-    // Finally we copy the dynamic array created into the pool as a fixed size
-    // one.
-    if (themes_arr.len > 0) {
-        *num_themes = themes_arr.len;
-        *themes = pom_push_size (pool, sizeof (struct icon_theme_t) * themes_arr.len);
-        memcpy (*themes, themes_arr.data, sizeof(struct icon_theme_t) * themes_arr.len);
-    }
-
-    it_da_free (&themes_arr);
-}
-
-gint str_cmp_callback (gconstpointer a, gconstpointer b)
-{
-    return g_ascii_strcasecmp ((const char*)a, (const char*)b);
-}
-
-void copy_key_into_list (gpointer key, gpointer value, gpointer user_data)
-{
-  GList **list = user_data;
-  *list = g_list_prepend (*list, g_strdup (key));
+    if (icon_theme->icon_names != NULL)
+        g_hash_table_destroy (icon_theme->icon_names);
+    mem_pool_destroy (&icon_theme->pool);
 }
 
 // I have to find this information directly from the icon directories and
@@ -489,10 +374,9 @@ void copy_key_into_list (gpointer key, gpointer value, gpointer user_data)
 // I expected Hicolor icons to be there because it's the fallback theme, but I
 // didn't expect any of the rest. All this is probably done for backward
 // compatibility reasons but it does not work for what we want.
-GList* get_theme_icon_names (struct icon_theme_t *theme)
+void set_theme_icon_names (struct icon_theme_t *theme)
 {
-  GHashTable *ht = g_hash_table_new (g_str_hash, g_str_equal);
-  mem_pool_t local_pool = {0};
+  theme->icon_names = g_hash_table_new (g_str_hash, g_str_equal);
 
   if (theme->dir_name != NULL) {
       int i;
@@ -531,8 +415,8 @@ GList* get_theme_icon_names (struct icon_theme_t *theme)
                       if (stat(str_data(&theme_dir), &st) == 0 &&
                           S_ISREG(st.st_mode) &&
                           fname_has_valid_extension (entry_info->d_name, &icon_name_len)) {
-                          char *icon_name = pom_strndup (&local_pool, entry_info->d_name, icon_name_len);
-                          g_hash_table_insert (ht, icon_name, NULL);
+                          char *icon_name = pom_strndup (&theme->pool, entry_info->d_name, icon_name_len);
+                          g_hash_table_insert (theme->icon_names, icon_name, NULL);
                       }
                   }
               }
@@ -559,8 +443,8 @@ GList* get_theme_icon_names (struct icon_theme_t *theme)
             if (stat(str_data(&path_str), &st) == 0 && S_ISREG(st.st_mode)) {
                 size_t icon_name_len;
                 if (fname_has_valid_extension(entry_info->d_name, &icon_name_len)) {
-                    char *icon_name = pom_strndup (&local_pool, entry_info->d_name, icon_name_len);
-                    g_hash_table_insert (ht, icon_name, NULL);
+                    char *icon_name = pom_strndup (&theme->pool, entry_info->d_name, icon_name_len);
+                    g_hash_table_insert (theme->icon_names, icon_name, NULL);
                 }
             }
         }
@@ -568,20 +452,210 @@ GList* get_theme_icon_names (struct icon_theme_t *theme)
         closedir (d);
       }
   }
-
-  GList *res = NULL;
-  g_hash_table_foreach (ht, copy_key_into_list, &res);
-  mem_pool_destroy (&local_pool);
-
-  return res;
 }
 
-templ_sort(icon_image_sort, struct icon_image_t*, (*a)->size < (*b)->size)                     \
+gint strcase_cmp_callback (gconstpointer a, gconstpointer b)
+{
+    return g_ascii_strcasecmp ((const char*)a, (const char*)b);
+}
+
+// This is case sensitive but will sort correctly strings with different cases
+// into alphabetical order AaBbCc not ABCabc.
+gint str_cmp_callback (gconstpointer a, gconstpointer b)
+{
+    int cmp = g_ascii_strcasecmp ((const char*)a, (const char*)b);
+    if (cmp == 0) {
+        return g_strcmp0 ((const char*)a, (const char*)b);
+    } else {
+        return cmp;
+    }
+}
+
+void app_load_all_icon_themes (struct app_t *app)
+{
+    GtkIconTheme *icon_theme = gtk_icon_theme_get_default ();
+    gchar **path;
+    gint num_paths;
+    gtk_icon_theme_get_search_path (icon_theme, &path, &num_paths);
+
+    // Locate all index.theme files that are in the search paths, and append a
+    // new icon_theme_t struct for each one.
+    int i;
+    for (i=0; i<num_paths; i++) {
+        char *curr_search_path = path[i];
+        string_t path_str = str_new (curr_search_path);
+        if (str_last(&path_str) != '/') {
+            str_cat_c (&path_str, "/");
+        }
+        uint32_t path_len = str_len (&path_str);
+
+        struct stat st;
+        if (stat(curr_search_path, &st) != -1 || errno != ENOENT) {
+            DIR *d = opendir (curr_search_path);
+            struct dirent *entry_info;
+            while (read_dir (d, &entry_info)) {
+                if (strcmp ("default", entry_info->d_name) != 0 && entry_info->d_name[0] != '.') {
+                    string_t theme_dir = str_new (entry_info->d_name);
+                    str_put (&path_str, path_len, &theme_dir);
+
+                    if (stat(str_data(&path_str), &st) == 0 && S_ISDIR(st.st_mode) &&
+                        file_lookup (str_data(&path_str), "index.theme")) {
+
+                        struct icon_theme_t *theme = app_icon_theme_new (app);
+                        theme->dir_name = pom_strdup (&theme->pool, entry_info->d_name);
+
+                        str_cat_c (&path_str, "/index.theme");
+                        theme->index_file = full_file_read (&theme->pool, str_data(&path_str));
+                        set_theme_name(theme);
+                    }
+                    str_free (&theme_dir);
+                }
+            }
+
+            closedir (d);
+
+        } else {
+            // curr_search_path does not exist.
+        }
+
+        str_free (&path_str);
+    }
+
+    // A theme can be spread across multiple search paths. Now that we know the
+    // internal name for each theme, we look for subdirectories with this
+    // internal name to know which directories a theme is spread across.
+    for (struct icon_theme_t *curr_theme = app->themes; curr_theme; curr_theme = curr_theme->next) {
+        char *found_dirs[num_paths];
+        uint32_t num_found = 0;
+        int j;
+        for (j=0; j<num_paths; j++) {
+            char *curr_search_path = path[j];
+            string_t path_str = str_new (curr_search_path);
+            if (str_last(&path_str) != '/') {
+                str_cat_c (&path_str, "/");
+            }
+            str_cat_c (&path_str, curr_theme->dir_name);
+
+            struct stat st;
+            if (stat(str_data(&path_str), &st) == 0 && S_ISDIR(st.st_mode)) {
+                found_dirs[num_found] = pom_strdup (&curr_theme->pool, str_data(&path_str));
+                num_found++;
+            }
+            str_free (&path_str);
+        }
+
+        curr_theme->dirs = (char**)pom_push_size (&curr_theme->pool, sizeof(char*)*num_found);
+        memcpy (curr_theme->dirs, found_dirs, sizeof(char*)*num_found);
+        curr_theme->num_dirs = num_found;
+    }
+
+    icon_theme_sort (&app->themes, -1);
+
+    // Unthemed icons are found inside search path directories but not in a
+    // directory. For these icons we add a zero initialized theme, and set as
+    // dirs all search paths with icons in them.
+    //
+    // NOTE: Search paths are not explored recursiveley for icons.
+    struct icon_theme_t *no_theme = app_icon_theme_new (app);
+    no_theme->name = "None";
+
+    char *found_dirs[num_paths];
+    uint32_t num_found = 0;
+    for (i=0; i<num_paths; i++) {
+        string_t path_str = str_new (path[i]);
+        if (str_last(&path_str) != '/') {
+            str_cat_c (&path_str, "/");
+        }
+        uint32_t path_len = str_len (&path_str);
+
+        struct stat st;
+        if (stat(str_data(&path_str), &st) == -1 && errno == ENOENT) {
+            // NOTE: Current search paths may contain non existent directories.
+            //printf ("Search path does not exist.\n");
+            continue;
+        }
+
+        DIR *d = opendir (str_data(&path_str));
+        struct dirent *entry_info;
+        while (read_dir (d, &entry_info)) {
+            str_put_c (&path_str, path_len, entry_info->d_name);
+
+            if (stat(str_data(&path_str), &st) == 0 && S_ISREG(st.st_mode)) {
+                if (fname_has_valid_extension (entry_info->d_name, NULL)) {
+                    uint32_t res_len = strlen (path[i]) + 1;
+                    found_dirs[num_found] = (char*)pom_push_size (&no_theme->pool, res_len);
+                    memcpy (found_dirs[num_found], path[i], res_len);
+                    num_found++;
+                    break;
+                }
+            }
+        }
+        str_free (&path_str);
+        closedir (d);
+    }
+
+    no_theme->dirs = (char**)pom_push_size (&no_theme->pool, sizeof(char*)*num_found);
+    memcpy (no_theme->dirs, found_dirs, sizeof(char*)*num_found);
+    no_theme->num_dirs = num_found;
+
+    // Find all icon names for each found theme and store them in the icon_names
+    // hash table.
+    for (struct icon_theme_t *curr_theme = app->themes; curr_theme; curr_theme = curr_theme->next) {
+        set_theme_icon_names (curr_theme);
+    }
+
+    // Add all icon themes into a structure so we can fake an "All" theme.
+    app->all_icon_names_pool = ZERO_INIT (mem_pool_t);
+    app->all_icon_names = g_tree_new (str_cmp_callback);
+
+    struct icon_theme_t *curr_theme = app->themes;
+    for (; curr_theme; curr_theme = curr_theme->next) {
+        GList *icon_names = g_hash_table_get_keys (curr_theme->icon_names);
+        for (GList *l = icon_names; l != NULL; l = l->next) {
+            if (!g_tree_lookup_extended (app->all_icon_names, l->data, NULL, NULL)) {
+                char *icon_name = pom_strdup (&app->all_icon_names_pool, l->data);
+                g_tree_insert (app->all_icon_names, icon_name, NULL);
+            }
+        }
+        g_list_free (icon_names);
+    }
+}
+
+void app_destroy (struct app_t *app)
+{
+    struct icon_theme_t *curr_theme = app->themes;
+    while (curr_theme != NULL) {
+        struct icon_theme_t *to_destroy = curr_theme;
+        curr_theme = curr_theme->next;
+
+        icon_theme_destroy (to_destroy);
+    }
+
+    mem_pool_destroy(&app->icon_view_pool);
+    free (app->selected_icon);
+
+    mem_pool_destroy(&app->all_icon_names_pool);
+    g_tree_destroy (app->all_icon_names);
+}
+
+// This makes scalable images always sort as the largest.
+bool is_img_lt (struct icon_image_t *a, struct icon_image_t *b)
+{
+    if (a->is_scalable == b->is_scalable) {
+        return a->size < b->size;
+    } else {
+        return b->is_scalable;
+    }
+}
+
+templ_sort_ll(icon_image_sort, struct icon_image_t, is_img_lt(*a, *b))
 
 void icon_view_compute (mem_pool_t *pool,
                         struct icon_theme_t *theme, const char *icon_name,
                         struct icon_view_t *icon_view)
 {
+    assert (strcmp (theme->name, "All") != 0);
+
     *icon_view = ZERO_INIT (struct icon_view_t);
     icon_view->scale = 1;
     icon_view->icon_name = pom_strndup (pool, icon_name, strlen(icon_name));
@@ -671,6 +745,7 @@ void icon_view_compute (mem_pool_t *pool,
 
                     // Add the new image at the end of the corresponding linked list
                     if (img.scale <= 3) {
+                        found_image = true;
                         *last_image[new_img->scale-1] = new_img;
                         last_image[new_img->scale-1] = &new_img->next;
                         num_images[img.scale-1]++;
@@ -694,23 +769,7 @@ void icon_view_compute (mem_pool_t *pool,
                     // can detect if sorting is required before and only sort if
                     // necessary.
                     // @performance
-                    struct icon_image_t *img = icon_view->images[i];
-                    struct icon_image_t *img_arr[num_images[i]];
-
-                    int j = 0;
-                    while (img != NULL) {
-                        img_arr[j] = img;
-                        j++;
-                        img = img->next;
-                    }
-
-                    icon_image_sort (img_arr, num_images[i]);
-
-                    icon_view->images[i] = img_arr[0];
-                    for (j=0; j<num_images[i] - 1; j++) {
-                        img_arr[j]->next = img_arr[j+1];
-                    }
-                    img_arr[j]->next = NULL;
+                    icon_image_sort (&icon_view->images[i], num_images[i]);
                 }
             }
 
@@ -720,6 +779,8 @@ void icon_view_compute (mem_pool_t *pool,
             // other ones.
             if (found_image) break;
         }
+
+        assert (found_image && "Icon not found in that theme");
 
     } else {
         int i;
@@ -770,43 +831,52 @@ void icon_view_compute (mem_pool_t *pool,
 
             // Create a GtkImage for the found image
             img->image = gtk_image_new_from_file (img->full_path);
+            struct stat st;
+            stat(img->full_path, &st);
+            img->file_size = st.st_size;
             gtk_widget_set_valign (img->image, GTK_ALIGN_END);
 
             // Find the size of the created image
             GdkPixbuf *pixbuf = gtk_image_get_pixbuf (GTK_IMAGE(img->image));
-            img->width = gdk_pixbuf_get_width(pixbuf);
-            img->height = gdk_pixbuf_get_height(pixbuf);
+            if (pixbuf) {
+                img->width = gdk_pixbuf_get_width(pixbuf);
+                img->height = gdk_pixbuf_get_height(pixbuf);
+            }
             gtk_widget_set_size_request (img->image, img->width, img->height);
 
             g_assert (img->image != NULL);
-            // We have to take a reference here because we want images to
-            // persist even after their parent widget gets destroyed
-            g_object_ref (G_OBJECT(img->image));
+            // The container to which images will be parented will get destroyed
+            // when changing icon scales, we need to take a reference here so we
+            // can go back to them. The lifespan of these images should be equal
+            // to icon_view_t, not to their parent container.
+            // @scale_change_destroys_images
+            g_object_ref_sink (G_OBJECT(img->image));
 
             img = img->next;
         }
     }
 }
 
-struct icon_theme_t *selected_theme = NULL;
-GtkWidget *icon_view_widget = NULL;
-mem_pool_t icon_view_pool;
-struct icon_view_t icon_view;
-
-void on_icon_selected (GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
+void app_update_selected_icon (struct app_t *app, const char *selected_icon)
 {
-    if (row == NULL) {
-        return;
+    if (app->selected_icon) {
+        if (strcmp (app->selected_icon, selected_icon) != 0) {
+            free (app->selected_icon);
+            app->selected_icon = strdup (selected_icon);
+        }
+    } else {
+        app->selected_icon = strdup (selected_icon);
     }
+}
 
-    GtkWidget *row_label = gtk_bin_get_child (GTK_BIN(row));
-    const char *icon_name = gtk_label_get_text (GTK_LABEL(row_label));
-
+void app_set_icon_view (struct app_t *app, const char *icon_name)
+{
     // Unref all GtkImages before creating the new icon_view. I don't like this,
     // istead of storing a GtkImage we should store our own data structure that
     // has things inside icon_view_pool.
-    for (int i=0; i<ARRAY_SIZE(icon_view.images); i++) {
-        struct icon_image_t *img = icon_view.images[i];
+    // @scale_change_destroys_images
+    for (int i=0; i<ARRAY_SIZE(app->icon_view.images); i++) {
+        struct icon_image_t *img = app->icon_view.images[i];
 
         while (img != NULL) {
             if (img->image != NULL) {
@@ -817,21 +887,45 @@ void on_icon_selected (GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
     }
 
     // Update data in the icon_view_t structure
-    mem_pool_destroy (&icon_view_pool);
-    icon_view_pool = ZERO_INIT(mem_pool_t);
-    icon_view = ZERO_INIT(struct icon_view_t);
-    icon_view_compute (&icon_view_pool, selected_theme, icon_name, &icon_view);
+    mem_pool_destroy (&app->icon_view_pool);
+    app->icon_view_pool = ZERO_INIT(mem_pool_t);
+    app_update_selected_icon (app, icon_name);
+    icon_view_compute (&app->icon_view_pool, app->selected_theme, icon_name, &app->icon_view);
 
-    replace_wrapped_widget(&icon_view_widget, draw_icon_view (&icon_view));
+    replace_wrapped_widget_defered (&app->icon_view_widget, draw_icon_view (&app->icon_view));
 }
 
-GtkWidget *icon_list = NULL, *search_entry = NULL;
-struct icon_theme_t *themes;
-uint32_t num_themes;
+void on_icon_selected (GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
+{
+    if (row == NULL) {
+        return;
+    }
+
+    GtkWidget *row_label = gtk_bin_get_child (GTK_BIN(row));
+    const char *icon_name = gtk_label_get_text (GTK_LABEL(row_label));
+
+    app_set_icon_view (&app, icon_name);
+}
+
+FK_LIST_BOX_ROW_SELECTED_CB (on_all_theme_row_selected)
+{
+    const char *icon_name = fk_list_box->visible_rows[idx]->data;
+
+    if (app.all_theme_selected) {
+        struct icon_theme_t *theme;
+        for (theme = app.themes; theme; theme = theme->next) {
+            if (g_hash_table_contains (theme->icon_names, icon_name)) break;
+        }
+        assert (theme != NULL);
+        app.selected_theme = theme;
+    }
+
+    app_set_icon_view (&app, icon_name);
+}
 
 gboolean on_key_press (GtkWidget *widget, GdkEventKey *event, gpointer data) {
     if (event->keyval == GDK_KEY_Escape){
-        gtk_entry_set_text (GTK_ENTRY(search_entry), "");
+        gtk_entry_set_text (GTK_ENTRY(app.search_entry), "");
         return TRUE;
     }
     return FALSE;
@@ -839,36 +933,87 @@ gboolean on_key_press (GtkWidget *widget, GdkEventKey *event, gpointer data) {
 
 gboolean search_filter (GtkListBoxRow *row, gpointer user_data)
 {
-    const gchar *search_str = gtk_entry_get_text (GTK_ENTRY(search_entry));
+    const gchar *search_str = gtk_entry_get_text (GTK_ENTRY(app.search_entry));
     GtkWidget *row_label = gtk_bin_get_child (GTK_BIN(row));
     const char * icon_name = gtk_label_get_text (GTK_LABEL(row_label));
 
-    if (strstr (icon_name, search_str) != NULL) {
-        return TRUE;
-    } else {
-        return FALSE;
-    }
+    return strstr (icon_name, search_str) != NULL ? TRUE : FALSE;
 }
 
-void on_theme_changed (GtkComboBox *themes_combobox, gpointer user_data)
+// The only way to iterate through a GTree is using a callback an
+// g_tree_foreach, this is the callback that builds the "All" theme icon name
+// list.
+struct all_theme_list_build_clsr_t {
+    GtkWidget *new_icon_list;
+    bool first;
+    const char *selected_icon;
+};
+
+gboolean all_theme_list_build (gpointer key, gpointer value, gpointer data)
 {
-    // NOTE: It's better to query who the prent widget is (rather than keeping a
-    // reference to it) because it can change in unexpected ways. For instance,
-    // in this case GtkScrolledWindow wraps icon_list in a GtkViewPort.
-    GtkWidget *parent = gtk_widget_get_parent (icon_list);
-    gtk_container_remove (GTK_CONTAINER(parent), icon_list);
+    struct all_theme_list_build_clsr_t *clsr = (struct all_theme_list_build_clsr_t*)data;
 
-    icon_list = gtk_list_box_new ();
-    add_custom_css (icon_list, ".list, list { background-color: transparent; }");
-    gtk_widget_set_vexpand (icon_list, TRUE);
-    gtk_widget_set_hexpand (icon_list, TRUE);
-    g_signal_connect (G_OBJECT(icon_list), "row-selected", G_CALLBACK (on_icon_selected), NULL);
-    gtk_list_box_set_filter_func (GTK_LIST_BOX(icon_list), search_filter, NULL, NULL);
+    GtkWidget *row = gtk_label_new (key);
+    gtk_container_add (GTK_CONTAINER(clsr->new_icon_list), row);
+    gtk_widget_set_halign (row, GTK_ALIGN_START);
 
-    selected_theme =
-        themes + gtk_combo_box_get_active (themes_combobox);
-    GList *icon_names = get_theme_icon_names (selected_theme);
-    icon_names = g_list_sort (icon_names, str_cmp_callback);
+    if (clsr->selected_icon == NULL && clsr->first) {
+        clsr->first = false;
+        clsr->selected_icon = key;
+    }
+
+    if (strcmp (clsr->selected_icon, key) == 0) {
+        GtkWidget *r = gtk_widget_get_parent (row);
+        gtk_list_box_select_row (GTK_LIST_BOX(clsr->new_icon_list), GTK_LIST_BOX_ROW(r));
+    }
+
+    gtk_widget_set_margin_start (row, 6);
+    gtk_widget_set_margin_end (row, 6);
+    gtk_widget_set_margin_top (row, 3);
+    gtk_widget_set_margin_bottom (row, 3);
+
+    return FALSE;
+}
+
+GtkWidget *all_icon_names_list_new (const char *selected_icon, const char **choosen_icon)
+{
+    assert (choosen_icon != NULL);
+
+    GtkWidget *new_icon_list = gtk_list_box_new ();
+    gtk_widget_set_vexpand (new_icon_list, TRUE);
+    gtk_widget_set_hexpand (new_icon_list, TRUE);
+    gtk_list_box_set_filter_func (GTK_LIST_BOX(new_icon_list), search_filter, NULL, NULL);
+
+    struct all_theme_list_build_clsr_t clsr;
+    clsr.new_icon_list = new_icon_list;
+    clsr.first = true;
+    clsr.selected_icon = selected_icon;
+
+    g_tree_foreach (app.all_icon_names, all_theme_list_build, &clsr);
+
+    *choosen_icon = clsr.selected_icon;
+    g_signal_connect (G_OBJECT(new_icon_list), "row-selected", G_CALLBACK (on_icon_selected), NULL);
+
+    return new_icon_list;
+}
+
+GtkWidget *icon_list_new (const char *theme_name, const char *selected_icon, const char **choosen_icon)
+{
+    assert (choosen_icon != NULL);
+
+    struct icon_theme_t *theme;
+    for (theme = app.themes; theme; theme = theme->next) {
+        if (strcmp (theme_name, theme->name) == 0) break;
+    }
+    assert (theme != NULL && "Theme name not found");
+
+    GtkWidget *new_icon_list = gtk_list_box_new ();
+    gtk_widget_set_vexpand (new_icon_list, TRUE);
+    gtk_widget_set_hexpand (new_icon_list, TRUE);
+    gtk_list_box_set_filter_func (GTK_LIST_BOX(new_icon_list), search_filter, NULL, NULL);
+
+    GList *icon_names = g_hash_table_get_keys (theme->icon_names);
+    icon_names = g_list_sort (icon_names, strcase_cmp_callback);
 
     bool first = true;
     uint32_t i = 0;
@@ -876,13 +1021,17 @@ void on_theme_changed (GtkComboBox *themes_combobox, gpointer user_data)
     for (l = icon_names; l != NULL; l = l->next)
     {
         GtkWidget *row = gtk_label_new (l->data);
-        gtk_container_add (GTK_CONTAINER(icon_list), row);
+        gtk_container_add (GTK_CONTAINER(new_icon_list), row);
         gtk_widget_set_halign (row, GTK_ALIGN_START);
 
-        if (first) {
+        if (selected_icon == NULL && first) {
             first = false;
+            selected_icon = l->data;
+        }
+
+        if (strcmp (selected_icon, l->data) == 0) {
             GtkWidget *r = gtk_widget_get_parent (row);
-            gtk_list_box_select_row (GTK_LIST_BOX(icon_list), GTK_LIST_BOX_ROW(r));
+            gtk_list_box_select_row (GTK_LIST_BOX(new_icon_list), GTK_LIST_BOX_ROW(r));
         }
 
         gtk_widget_set_margin_start (row, 6);
@@ -891,18 +1040,112 @@ void on_theme_changed (GtkComboBox *themes_combobox, gpointer user_data)
         gtk_widget_set_margin_bottom (row, 3);
         i++;
     }
+    g_list_free (icon_names);
 
-    gtk_container_add (GTK_CONTAINER(parent), icon_list);
-    gtk_widget_show_all(icon_list);
+    *choosen_icon = selected_icon;
+    g_signal_connect (G_OBJECT(new_icon_list), "row-selected", G_CALLBACK (on_icon_selected), NULL);
+    return new_icon_list;
+}
+
+void on_theme_changed (GtkComboBox *themes_combobox, gpointer user_data);
+GtkWidget *theme_selector_new (const char *theme_name)
+{
+    GtkWidget *themes_combobox;
+    GtkWidget *theme_selector = labeled_combobox_new ("Theme:", &themes_combobox);
+    combo_box_text_append_text_with_id (GTK_COMBO_BOX_TEXT(themes_combobox), "All");
+    for (struct icon_theme_t *curr_theme = app.themes; curr_theme; curr_theme = curr_theme->next) {
+        combo_box_text_append_text_with_id (GTK_COMBO_BOX_TEXT(themes_combobox), curr_theme->name);
+    }
+    gtk_combo_box_set_active_id (GTK_COMBO_BOX(themes_combobox), theme_name);
+    g_signal_connect (G_OBJECT(themes_combobox), "changed", G_CALLBACK (on_theme_changed), NULL);
+    return theme_selector;
+}
+
+void on_theme_changed (GtkComboBox *themes_combobox, gpointer user_data)
+{
+    const char *icon_name = NULL;
+    const char* theme_name = gtk_combo_box_get_active_id (themes_combobox);
+    if (strcmp (theme_name, "All") == 0) {
+        app.all_theme_selected = true;
+
+        replace_wrapped_widget (&app.icon_list, app.all_icon_names_widget);
+
+        struct icon_theme_t *theme;
+        for (theme = app.themes; theme; theme = theme->next) {
+            if (g_hash_table_contains (theme->icon_names, app.all_icon_names_first)) break;
+        }
+        icon_name = app.all_icon_names_first;
+        assert (theme != NULL);
+        theme_name = theme->name;
+
+    } else {
+        app.all_theme_selected = false;
+    }
+
+    app_set_selected_theme (&app, theme_name, icon_name);
+}
+
+void app_set_selected_theme (struct app_t *app, const char *theme_name, const char *selected_icon)
+{
+    assert (strcmp (theme_name, "All") != 0);
+
+    struct icon_theme_t *curr_theme;
+    for (curr_theme = app->themes; curr_theme; curr_theme = curr_theme->next) {
+        if (strcmp (theme_name, curr_theme->name) == 0) break;
+    }
+    assert (curr_theme != NULL && "Theme name not found");
+    app->selected_theme = curr_theme;
+
+    const char *choosen_icon = selected_icon;
+    if (!app->all_theme_selected) {
+        GtkWidget *new_icon_list = icon_list_new (theme_name, selected_icon, &choosen_icon);
+        replace_wrapped_widget (&app->icon_list, new_icon_list);
+
+        GtkWidget *new_theme_selector = theme_selector_new (theme_name);
+        replace_wrapped_widget_defered (&app->theme_selector, new_theme_selector);
+    }
+
+    app_update_selected_icon (app, choosen_icon);
+    app_set_icon_view (app, app->selected_icon);
 }
 
 void on_search_changed (GtkEditable *search_entry, gpointer user_data)
 {
-    gtk_list_box_invalidate_filter (GTK_LIST_BOX(icon_list));
+    if (app.all_theme_selected) {
+        const gchar *search_str = gtk_entry_get_text (GTK_ENTRY(search_entry));
+        for (int i=0; i<app.fk_list_box.num_rows; i++) {
+            const char *icon_name = app.fk_list_box.rows[i].data;
+            app.fk_list_box.rows[i].hidden = (strstr (icon_name, search_str) == NULL);
+        }
+        fk_list_box_refresh_hidden (&app.fk_list_box);
+
+    } else {
+        gtk_list_box_invalidate_filter (GTK_LIST_BOX(app.icon_list));
+    }
 }
+
+gboolean delete_callback (GtkWidget *widget, GdkEvent *event, gpointer user_data)
+{
+    gtk_main_quit ();
+    return FALSE;
+}
+
+gboolean all_theme_row_build (gpointer key, gpointer value, gpointer data)
+{
+    struct fk_list_box_t *fk_list_box = (struct fk_list_box_t *)data;
+    struct fk_list_box_row_t *row = fk_list_box_row_new (fk_list_box);
+    row->data = key;
+    return FALSE;
+}
+
 int main(int argc, char *argv[])
 {
     GtkWidget *window;
+    app = (struct app_t){
+#define EXTENSION(name,str) str,
+        .valid_extensions = { VALID_EXTENSIONS }
+#undef EXTENSION
+    };
 
     gtk_init(&argc, &argv);
 
@@ -915,61 +1158,69 @@ int main(int argc, char *argv[])
     gtk_window_set_titlebar (GTK_WINDOW(window), header_bar);
 
     g_signal_connect (G_OBJECT(window), "delete-event", G_CALLBACK (delete_callback), NULL);
-    g_signal_connect (G_OBJECT(window), "key_press_event", G_CALLBACK (on_key_press), NULL);
+    g_signal_connect (G_OBJECT(window), "key-press-event", G_CALLBACK (on_key_press), NULL);
 
-    mem_pool_t pool = {0};
-    get_all_icon_themes (&pool, &themes, &num_themes);
+    app_load_all_icon_themes (&app);
 
-    icon_list = gtk_list_box_new ();
-    gtk_widget_set_vexpand (icon_list, TRUE);
-    gtk_widget_set_hexpand (icon_list, TRUE);
-    g_signal_connect (G_OBJECT(icon_list), "row-selected", G_CALLBACK (on_icon_selected), NULL);
+    app.search_entry = gtk_search_entry_new ();
+    g_signal_connect (G_OBJECT(app.search_entry), "changed", G_CALLBACK (on_search_changed), NULL);
 
-    GtkWidget *themes_label = gtk_label_new ("Theme:");
-    GtkStyleContext *ctx = gtk_widget_get_style_context (themes_label);
-    gtk_style_context_add_class (ctx, "h5");
-    gtk_widget_set_margin_start (themes_label, 6);
-
-    GtkWidget *themes_combobox = gtk_combo_box_text_new ();
-    gtk_widget_set_margin_top (themes_combobox, 6);
-    gtk_widget_set_margin_bottom (themes_combobox, 6);
-    gtk_widget_set_margin_start (themes_combobox, 12);
-    gtk_widget_set_margin_end (themes_combobox, 6);
-    int i;
-    for (i=0; i<num_themes; i++) {
-        gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT(themes_combobox), themes[i].name);
-    }
-    g_signal_connect (G_OBJECT(themes_combobox), "changed", G_CALLBACK (on_theme_changed), NULL);
-
-    GtkWidget *theme_selector = gtk_grid_new ();
-    gtk_grid_attach (GTK_GRID(theme_selector), themes_label, 0, 0, 1, 1);
-    gtk_grid_attach (GTK_GRID(theme_selector), themes_combobox, 1, 0, 1, 1);
-
+    app.icon_list = gtk_grid_new (); // Placeholder
     GtkWidget *scrolled_icon_list = gtk_scrolled_window_new (NULL, NULL);
     gtk_scrolled_window_disable_hscroll (GTK_SCROLLED_WINDOW(scrolled_icon_list));
-    gtk_container_add (GTK_CONTAINER (scrolled_icon_list), icon_list);
+    gtk_container_add (GTK_CONTAINER (scrolled_icon_list), app.icon_list);
 
-    search_entry = gtk_search_entry_new ();
-    add_custom_css (search_entry, ".entry, entry { border-radius: 13px; }");
-    g_signal_connect (G_OBJECT(search_entry), "changed", G_CALLBACK (on_search_changed), NULL);
+    app.theme_selector = gtk_grid_new (); // Placeholder
 
     GtkWidget *sidebar = gtk_grid_new ();
-    gtk_grid_attach (GTK_GRID(sidebar), search_entry, 0, 0, 1, 1);
+    gtk_grid_attach (GTK_GRID(sidebar), app.search_entry, 0, 0, 1, 1);
     gtk_grid_attach (GTK_GRID(sidebar), scrolled_icon_list, 0, 1, 1, 1);
-    gtk_grid_attach (GTK_GRID(sidebar), theme_selector, 0, 2, 1, 1);
+    gtk_grid_attach (GTK_GRID(sidebar), wrap_gtk_widget(app.theme_selector), 0, 2, 1, 1);
 
-    icon_view_widget = gtk_grid_new ();
+    app.icon_view_widget = gtk_grid_new (); // Placeholder
     GtkWidget *paned = fix_gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
     gtk_paned_pack1 (GTK_PANED(paned), sidebar, FALSE, FALSE);
-    gtk_paned_pack2 (GTK_PANED(paned), wrap_gtk_widget(icon_view_widget), TRUE, TRUE);
+    gtk_paned_pack2 (GTK_PANED(paned), wrap_gtk_widget(app.icon_view_widget), TRUE, TRUE);
 
-    gtk_combo_box_set_active (GTK_COMBO_BOX(themes_combobox), 0);
+    app.all_icon_names_widget = fk_list_box_init (&app.fk_list_box,
+                                                  on_all_theme_row_selected);
+    fk_list_box_rows_start (&app.fk_list_box, g_tree_nnodes(app.all_icon_names));
+    g_tree_foreach (app.all_icon_names, all_theme_row_build, &app.fk_list_box);
+
+    app.all_icon_names_first = app.fk_list_box.rows[0].data;
+    g_object_ref_sink (app.all_icon_names_widget);
+
+    // Set the fake "All" theme as default.
+    {
+        const char *icon_name = NULL;
+        const char* theme_name = NULL;
+        app.all_theme_selected = true;
+
+        replace_wrapped_widget (&app.icon_list, app.all_icon_names_widget);
+
+        struct icon_theme_t *theme;
+        for (theme = app.themes; theme; theme = theme->next) {
+            if (g_hash_table_contains (theme->icon_names, app.all_icon_names_first)) break;
+        }
+        icon_name = app.all_icon_names_first;
+        assert (theme != NULL);
+        theme_name = theme->name;
+
+        GtkWidget *new_theme_selector = theme_selector_new ("All");
+        replace_wrapped_widget_defered (&app.theme_selector, new_theme_selector);
+
+        app_set_selected_theme (&app, theme_name, icon_name);
+    }
 
     gtk_container_add(GTK_CONTAINER(window), paned);
 
     gtk_widget_show_all(window);
 
     gtk_main();
+
+    fk_list_box_destroy (&app.fk_list_box);
+
+    app_destroy (&app);
 
     return 0;
 }

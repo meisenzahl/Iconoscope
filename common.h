@@ -14,6 +14,7 @@
 #include <string.h>
 #include <wordexp.h>
 #include <math.h>
+#include <stdarg.h>
 
 #ifdef __cplusplus
 #define ZERO_INIT(type) (type){}
@@ -1289,10 +1290,11 @@ void swap_n_bytes (void *a, void*b, uint32_t n)
     }
 }
 
-// Templetized merge sort
+// Templetized merge sort for arrays
+//
 // IS_A_LT_B is an expression where a and b are pointers
 // to _arr_ true when *a<*b.
-// NOTE: IS_A_LT_B as defined will sort the array in ascending order.
+// NOTE: IS_A_LT_B as defined, will sort the array in ascending order.
 #define templ_sort(FUNCNAME,TYPE,IS_A_LT_B)                     \
 void FUNCNAME ## _user_data (TYPE *arr, int n, void *user_data) \
 {                                                               \
@@ -1329,7 +1331,7 @@ void FUNCNAME ## _user_data (TYPE *arr, int n, void *user_data) \
         }                                                       \
     }                                                           \
 }                                                               \
-\
+                                                                \
 void FUNCNAME(TYPE *arr, int n) {                               \
     FUNCNAME ## _user_data (arr,n,NULL);                        \
 }
@@ -1445,6 +1447,56 @@ void print_u64_array (uint64_t *arr, int n)
     }
     printf ("%"PRIu64"]\n", arr[i]);
 }
+
+// Templetized linked list sort
+//
+// IS_A_LT_B is an expression where a and b are pointers of type TYPE and should
+// evaluate to true when *a<*b. NEXT_FIELD specifies the name of the field where
+// the next node pointer is found. The macro templ_sort_ll is convenience for
+// when this field's name is "next". Use n=-1 if the size is unknown, in this
+// case the full linked list will be iterated to compute it.
+// NOTE: IS_A_LT_B as defined, will sort the linked list in ascending order.
+// NOTE: The last node of the linked list is expected to have NEXT_FIELD field
+// set to NULL.
+// NOTE: It uses a pointer array of size n, and calls merge sort on that array.
+#define templ_sort_ll_next_field(FUNCNAME,TYPE,NEXT_FIELD,IS_A_LT_B)\
+templ_sort(FUNCNAME ## _arr, TYPE*, IS_A_LT_B)                      \
+void FUNCNAME ## _user_data (TYPE **head, int n, void *user_data)   \
+{                                                                   \
+    if (n == -1) {                                                  \
+        n = 0;                                                      \
+        TYPE *node = *head;                                         \
+        while (node != NULL) {                                      \
+            n++;                                                    \
+            node = node->NEXT_FIELD;                                \
+        }                                                           \
+    }                                                               \
+                                                                    \
+    TYPE *node = *head;                                             \
+    TYPE *arr[n];                                                   \
+                                                                    \
+    int j = 0;                                                      \
+    while (node != NULL) {                                          \
+        arr[j] = node;                                              \
+        j++;                                                        \
+        node = node->NEXT_FIELD;                                    \
+    }                                                               \
+                                                                    \
+    FUNCNAME ## _arr (arr, n);                                      \
+                                                                    \
+    *head = arr[0];                                                 \
+    for (j=0; j<n - 1; j++) {                                       \
+        arr[j]->NEXT_FIELD = arr[j+1];                              \
+    }                                                               \
+    arr[j]->NEXT_FIELD = NULL;                                      \
+}                                                                   \
+                                                                    \
+void FUNCNAME(TYPE **head, int n) {                                 \
+    FUNCNAME ## _user_data (head,n,NULL);                           \
+}
+
+#define templ_sort_ll(FUNCNAME,TYPE,IS_A_LT_B) \
+    templ_sort_ll_next_field(FUNCNAME,TYPE,next,IS_A_LT_B)
 
 void print_line (const char *sep, int len)
 {
@@ -1865,6 +1917,7 @@ void mem_pool_end_temporary_memory (mem_pool_temp_marker_t mrkr)
 #define pom_push_array(pool, n, type) pom_push_size(pool, (n)*sizeof(type))
 #define pom_push_size(pool, size) (pool==NULL? malloc(size) : mem_pool_push_size(pool,size))
 
+#define pom_strdup(pool,str) pom_strndup(pool,str,((str)!=NULL?strlen(str):0))
 static inline
 char* pom_strndup (mem_pool_t *pool, const char *str, uint32_t str_len)
 {
@@ -1882,6 +1935,29 @@ void* pom_dup (mem_pool_t *pool, void *data, uint32_t size)
     return res;
 }
 
+#if __GNUC__ > 2
+#define GCC_PRINTF_FORMAT(fmt_idx, arg_idx) __attribute__((format (printf, fmt_idx, arg_idx)))
+#else
+#define GCC_PRINTF_FORMAT(fmt_idx, arg_idx)
+#endif
+
+GCC_PRINTF_FORMAT(2, 3)
+char* pprintf (mem_pool_t *pool, const char *format, ...)
+{
+    va_list args1, args2;
+    va_start (args1, format);
+    va_copy (args2, args1);
+
+    size_t size = vsnprintf (NULL, 0, format, args1) + 1;
+    va_end (args1);
+
+    char *str = mem_pool_push_size (pool, size);
+
+    vsnprintf (str, size, format, args2);
+    va_end (args2);
+
+    return str;
+}
 
 // Flatten an array of null terminated strings into a single string allocated
 // into _pool_ or heap.

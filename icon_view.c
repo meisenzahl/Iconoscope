@@ -2,50 +2,29 @@
  * Copiright (C) 2018 Santiago León O.
  */
 
-struct icon_image_t {
-    GtkWidget *image;
-    int width, height;
-    char *label; // can be NULL
+#define UNSELECTED_ICON_BOX_STYLE       \
+"box {"                                 \
+"    padding: 6px;"                     \
+"    border-radius: 3px;"               \
+"    border: 1px solid rgba(0,0,0,0);"  \
+"}"
 
-    // Information found in the index file
-    char *theme_dir;
-    char *path;
-    char *full_path;
-    int size;
-    int min_size;
-    int max_size;
-    int scale;
-    char* type; // can be NULL
-    char* context; // can be NULL
-    bool is_scalable; // True if directory in index file contains "scalable"
+#define SELECTED_ICON_BOX_STYLE \
+"box {"                         \
+"    padding: 6px;"             \
+"    border-radius: 3px;"       \
+"    border: 1px solid #777;"   \
+"}"
 
-    struct icon_image_t *next;
-    struct icon_view_t *view; // Pointer to the icon_view_t this icon_image_t is member of.
-};
-
-struct icon_view_t {
-    char *icon_name;
-
-    int scale;
-    struct icon_image_t *images[3];
-
-    //int num_other_themes;
-    //char **other_themes;
-
-    // UI Widgets
-    GtkWidget *icon_dpy;
-    GtkWidget *image_data_dpy;
-};
-
-GtkWidget *spaced_grid_new ()
+GtkWidget *spaced_grid_new (int spacing)
 {
     GtkWidget *new_grid = gtk_grid_new ();
-    gtk_widget_set_margin_start (GTK_WIDGET(new_grid), 12);
-    gtk_widget_set_margin_end (GTK_WIDGET(new_grid), 12);
-    gtk_widget_set_margin_top (GTK_WIDGET(new_grid), 12);
-    gtk_widget_set_margin_bottom (GTK_WIDGET(new_grid), 12);
-    gtk_grid_set_row_spacing (GTK_GRID(new_grid), 12);
-    gtk_grid_set_column_spacing (GTK_GRID(new_grid), 12);
+    gtk_widget_set_margin_start (GTK_WIDGET(new_grid), spacing);
+    gtk_widget_set_margin_end (GTK_WIDGET(new_grid), spacing);
+    gtk_widget_set_margin_top (GTK_WIDGET(new_grid), spacing);
+    gtk_widget_set_margin_bottom (GTK_WIDGET(new_grid), spacing);
+    gtk_grid_set_row_spacing (GTK_GRID(new_grid), spacing);
+    gtk_grid_set_column_spacing (GTK_GRID(new_grid), spacing);
     return new_grid;
 }
 
@@ -76,6 +55,49 @@ char* str_or_dash (char *str)
     }
 }
 
+// NOTE: requires #include <locale.h>
+void bytes_to_human_readable (off_t size, char *buff, size_t buff_len)
+{
+    assert (buff_len > 9);
+
+    int i = 0;
+    float hr = size;
+    while (hr > 1024) {
+        i++;
+        hr /= 1024;
+    }
+
+    char *unit = "?";
+    if (i == 0) {
+        unit = "B";
+    } else if (i == 1) {
+        unit = "K";
+    } else if (i == 2) {
+        unit = "M";
+    } else if (i == 3) {
+        unit = "G";
+    } else if (i == 4) {
+        unit = "T";
+    } else if (i == 5) {
+        unit = "P";
+    } else if (i == 6) {
+        unit = "E";
+    } else if (i == 7) {
+        unit = "Z";
+    } else if (i == 8) {
+        unit = "Y";
+    }
+
+    struct lconv *locale = localeconv();
+    int int_part = (int)hr;
+    int dec_part = (int)((hr - int_part)*10);
+    if (dec_part != 0) {
+        snprintf (buff, buff_len, "%d%s%d %s", int_part, locale->decimal_point, dec_part, unit);
+    } else {
+        snprintf (buff, buff_len, "%d %s", int_part, unit);
+    }
+}
+
 GtkWidget* image_data_dpy_new (struct icon_image_t *img)
 {
     GtkWidget *data = gtk_grid_new ();
@@ -97,6 +119,9 @@ GtkWidget* image_data_dpy_new (struct icon_image_t *img)
     str = img->width < 1 || img->height < 1 ?  "-" : buff;
     data_dpy_append (data, "Image Size:", str, i++);
 
+    bytes_to_human_readable (img->file_size, buff, ARRAY_SIZE(buff));
+    data_dpy_append (data, "File Size:", buff, i++);
+
     snprintf (buff, ARRAY_SIZE(buff), "%d", img->size);
     str = img->size < 1 ?  "-" : buff;
     data_dpy_append (data, "Size:", str, i++);
@@ -110,11 +135,28 @@ GtkWidget* image_data_dpy_new (struct icon_image_t *img)
     return data;
 }
 
+void set_icon_box_border (struct icon_image_t *img)
+{
+    img->custom_css = replace_custom_css (img->box, img->custom_css, SELECTED_ICON_BOX_STYLE);
+}
+
+void unset_icon_box_border (struct icon_image_t *img)
+{
+    img->custom_css = replace_custom_css (img->box, img->custom_css, UNSELECTED_ICON_BOX_STYLE);
+}
+
 void on_image_clicked (GtkWidget *widget, GdkEvent *event, gpointer user_data)
 {
     struct icon_image_t *img = (struct icon_image_t *)user_data;
     GtkWidget *image_data_dpy = image_data_dpy_new (img);
     g_assert (img->view->image_data_dpy != NULL);
+
+    if (img->view->selected_img != NULL) {
+        unset_icon_box_border (img->view->selected_img);
+    }
+
+    img->view->selected_img = img;
+    set_icon_box_border (img);
 
     // Replace image_data_dpy widget
     GtkWidget *parent = gtk_widget_get_parent (img->view->image_data_dpy);
@@ -124,20 +166,55 @@ void on_image_clicked (GtkWidget *widget, GdkEvent *event, gpointer user_data)
     gtk_widget_show_all (image_data_dpy);
 }
 
+char* new_bgcolor_style_str (mem_pool_t *pool, char *node_name, dvec4 color)
+{
+    char *str =
+        pprintf (pool,
+                 "%s {"
+                 "    background-color: rgba(%d,%d,%d,%d);"
+                 "}",
+                 node_name,
+                 (int)(color.r*255), (int)(color.g*255), (int)(color.b*255), (int)(color.a*255));
+    return str;
+}
+
+void icon_view_update_bg_color (struct icon_view_t *icon_view, dvec4 color)
+{
+    mem_pool_t pool = {0};
+    char *style = new_bgcolor_style_str (&pool, "scrolledwindow", color);
+    icon_view->scrolled_window_custom_css =
+        replace_custom_css (icon_view->scrolled_window, icon_view->scrolled_window_custom_css,
+                            style);
+    mem_pool_destroy (&pool);
+}
+
+void on_color_button_clicked (GtkColorButton *button, gpointer user_data)
+{
+    struct icon_view_t *icon_view = (struct icon_view_t*)user_data;
+    GdkRGBA gdk_color;
+    gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(button), &gdk_color);
+    dvec4 color = RGBA(gdk_color.red, gdk_color.green, gdk_color.blue, gdk_color.alpha);
+    icon_view_update_bg_color (icon_view, color);
+    app.bg_color = color;
+}
+
 GtkWidget* icon_view_create_icon_dpy (struct icon_view_t *icon_view, int scale)
 {
     // NOTE: At least one package (aptdaemon-data) provides animated icons in a
     // single file by appending the frames side by side.  Here we detect that
     // case and instead display these icons vertically.
-    GtkOrientation all_icons_or = icon_view->images[scale-1]->width/icon_view->images[scale-1]->height > 1 ?
+    GtkOrientation all_icons_or = icon_view->images[scale-1]->width/icon_view->images[scale-1]->height > 2 ?
         GTK_ORIENTATION_VERTICAL : GTK_ORIENTATION_HORIZONTAL;
-    GtkWidget *all_icons = gtk_box_new (all_icons_or, 24);
+    GtkWidget *all_icons = gtk_box_new (all_icons_or, 12);
 
     struct icon_image_t *last_img = NULL;
     struct icon_image_t *img = icon_view->images[scale-1];
 
     while (img != NULL) {
         GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
+        img->box = box;
+        img->custom_css = add_custom_css (box, UNSELECTED_ICON_BOX_STYLE);
+
         gtk_widget_set_valign (box,GTK_ALIGN_END);
         gtk_widget_set_vexpand (box, FALSE);
 
@@ -157,13 +234,15 @@ GtkWidget* icon_view_create_icon_dpy (struct icon_view_t *icon_view, int scale)
         gtk_container_add (GTK_CONTAINER(all_icons), hitbox);
 
         if(img->next == NULL) {
+            icon_view->selected_img = img;
+            set_icon_box_border (img);
             last_img = img;
         }
         img = img->next;
     }
 
     // Place the icon list inside a GtkGrid so they are centered
-    GtkWidget *icon_dpy = spaced_grid_new ();
+    GtkWidget *icon_dpy = spaced_grid_new (12);
     gtk_widget_set_valign (icon_dpy, GTK_ALIGN_CENTER);
     gtk_widget_set_halign (icon_dpy, GTK_ALIGN_CENTER);
     gtk_widget_set_hexpand (icon_dpy, TRUE);
@@ -178,10 +257,34 @@ GtkWidget* icon_view_create_icon_dpy (struct icon_view_t *icon_view, int scale)
 
     // Wrap icon_dpy into a GtkScrolledWindow
     GtkWidget *scrolled_window = gtk_scrolled_window_new (NULL, NULL);
+    mem_pool_t pool = {0};
+    icon_view->scrolled_window_custom_css =
+        add_custom_css (scrolled_window, new_bgcolor_style_str (&pool, "scrolledwindow", app.bg_color));
+    mem_pool_destroy (&pool);
+    icon_view->scrolled_window = scrolled_window;
+
     gtk_widget_set_hexpand (scrolled_window, TRUE);
     gtk_widget_set_vexpand (scrolled_window, TRUE);
     gtk_container_add (GTK_CONTAINER (scrolled_window), icon_dpy);
-    return scrolled_window;
+
+    GdkRGBA c = GDK_RGBA_FROM_RGBA(app.bg_color);
+    GtkWidget *button = gtk_color_button_new_with_rgba (&c);
+    gtk_color_chooser_set_use_alpha (GTK_COLOR_CHOOSER(button), TRUE);
+    add_custom_css (button,
+                    "button {"
+                    "    background-color: @bg_color;"
+                    "}");
+
+    g_signal_connect (G_OBJECT(button), "color-set", G_CALLBACK(on_color_button_clicked), icon_view);
+    GtkWidget *toolbar = spaced_grid_new (6);
+    gtk_container_add (GTK_CONTAINER (toolbar), button);
+
+    GtkWidget *overlay = gtk_overlay_new ();
+    gtk_container_add (GTK_CONTAINER (overlay), scrolled_window);
+    gtk_overlay_add_overlay (GTK_OVERLAY(overlay), toolbar);
+    gtk_overlay_set_overlay_pass_through (GTK_OVERLAY(overlay), toolbar, TRUE);
+
+    return overlay;
 }
 
 void on_scale_toggled (GtkToggleButton *button, gpointer user_data)
@@ -199,7 +302,6 @@ GtkWidget* scale_selector_new (struct icon_view_t *icon_view)
 {
     GtkWidget *selector = gtk_button_box_new (GTK_ORIENTATION_HORIZONTAL);
     gtk_widget_set_halign (selector, GTK_ALIGN_END);
-    gtk_widget_set_hexpand (selector, TRUE);
     gtk_button_box_set_layout (GTK_BUTTON_BOX(selector), GTK_BUTTONBOX_EXPAND);
 
     GSList *group = NULL;
@@ -220,12 +322,18 @@ GtkWidget* scale_selector_new (struct icon_view_t *icon_view)
     return selector;
 }
 
+void on_icon_view_theme_changed (GtkComboBox *themes_combobox, gpointer user_data)
+{
+    const char* theme_name = gtk_combo_box_get_active_id (themes_combobox);
+    app_set_selected_theme (&app, theme_name, app.selected_icon);
+}
+
 GtkWidget* draw_icon_view (struct icon_view_t *icon_view)
 {
     icon_view->icon_dpy = icon_view_create_icon_dpy (icon_view, 1);
 
     // Create the icon data pane
-    GtkWidget *data_pane = spaced_grid_new ();
+    GtkWidget *data_pane = spaced_grid_new (12);
     GtkWidget *icon_name_label = gtk_label_new (icon_view->icon_name);
     add_css_class (icon_name_label, "h2");
     gtk_label_set_selectable (GTK_LABEL(icon_name_label), TRUE);
@@ -233,14 +341,30 @@ GtkWidget* draw_icon_view (struct icon_view_t *icon_view)
     gtk_widget_set_halign (icon_name_label, GTK_ALIGN_START);
     gtk_grid_attach (GTK_GRID(data_pane), icon_name_label, 0, 0, 1, 1);
 
+    GtkWidget *themes_combobox;
+    GtkWidget *theme_selector = labeled_combobox_new ("Theme:", &themes_combobox);
+    for (struct icon_theme_t *curr_theme = app.themes; curr_theme; curr_theme = curr_theme->next) {
+        if (g_hash_table_contains (curr_theme->icon_names, icon_view->icon_name)) {
+            combo_box_text_append_text_with_id (GTK_COMBO_BOX_TEXT(themes_combobox), curr_theme->name);
+        }
+    }
+    gtk_combo_box_set_active_id (GTK_COMBO_BOX(themes_combobox), app.selected_theme->name);
+    g_signal_connect (G_OBJECT(themes_combobox), "changed", G_CALLBACK (on_icon_view_theme_changed), NULL);
+    gtk_widget_set_halign (theme_selector, GTK_ALIGN_END);
+    gtk_widget_set_hexpand (theme_selector, TRUE);
+
     GtkWidget *scale_selector = scale_selector_new (icon_view);
-    gtk_grid_attach (GTK_GRID(data_pane), scale_selector, 1, 0, 1, 1);
+
+    GtkWidget *icon_widgets = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 18);
+    gtk_container_add (GTK_CONTAINER(icon_widgets), theme_selector);
+    gtk_container_add (GTK_CONTAINER(icon_widgets), scale_selector);
+    gtk_grid_attach (GTK_GRID(data_pane), icon_widgets, 1, 0, 1, 1);
 
     gtk_grid_attach (GTK_GRID(data_pane),
                      wrap_gtk_widget(icon_view->image_data_dpy),
                      0, 1, 1, 1);
 
-    return fake_paned (GTK_ORIENTATION_VERTICAL,
-                       wrap_gtk_widget(icon_view->icon_dpy),
-                       data_pane);
+    return fk_paned (GTK_ORIENTATION_VERTICAL,
+                     wrap_gtk_widget(icon_view->icon_dpy),
+                     data_pane);
 }
