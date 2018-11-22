@@ -145,25 +145,29 @@ void unset_icon_box_border (struct icon_image_t *img)
     img->custom_css = replace_custom_css (img->box, img->custom_css, UNSELECTED_ICON_BOX_STYLE);
 }
 
-void on_image_clicked (GtkWidget *widget, GdkEvent *event, gpointer user_data)
+gboolean on_image_clicked (GtkWidget *widget, GdkEvent *event, gpointer user_data)
 {
     struct icon_image_t *img = (struct icon_image_t *)user_data;
-    GtkWidget *image_data_dpy = image_data_dpy_new (img);
-    g_assert (img->view->image_data_dpy != NULL);
+    if (img->view->selected_img != img) {
+        GtkWidget *image_data_dpy = image_data_dpy_new (img);
+        g_assert (img->view->image_data_dpy != NULL);
 
-    if (img->view->selected_img != NULL) {
         unset_icon_box_border (img->view->selected_img);
+
+        img->view->selected_img = img;
+        set_icon_box_border (img);
+
+        // Replace image_data_dpy widget
+        GtkWidget *parent = gtk_widget_get_parent (img->view->image_data_dpy);
+        gtk_container_remove (GTK_CONTAINER(parent), img->view->image_data_dpy);
+        gtk_container_add (GTK_CONTAINER(parent), image_data_dpy);
+        img->view->image_data_dpy = image_data_dpy;
+        gtk_widget_show_all (image_data_dpy);
     }
 
-    img->view->selected_img = img;
-    set_icon_box_border (img);
-
-    // Replace image_data_dpy widget
-    GtkWidget *parent = gtk_widget_get_parent (img->view->image_data_dpy);
-    gtk_container_remove (GTK_CONTAINER(parent), img->view->image_data_dpy);
-    gtk_container_add (GTK_CONTAINER(parent), image_data_dpy);
-    img->view->image_data_dpy = image_data_dpy;
-    gtk_widget_show_all (image_data_dpy);
+    // NOTE: We allways let the event go through so we have drag and drop even
+    // if the image wasn't selected.
+    return FALSE;
 }
 
 char* new_bgcolor_style_str (mem_pool_t *pool, char *node_name, dvec4 color)
@@ -198,6 +202,19 @@ void on_color_button_clicked (GtkColorButton *button, gpointer user_data)
     app.bg_color = color;
 }
 
+void on_drag_data_get (GtkWidget *widget, GdkDragContext *context, GtkSelectionData *data,
+                       guint info, guint time, gpointer user_data)
+{
+    struct icon_image_t *img = (struct icon_image_t *)user_data;
+    string_t uri = str_new ("file://");
+    str_cat_c (&uri, img->full_path);
+
+    char *uris[] = {str_data(&uri), NULL};
+    gtk_selection_data_set_uris (data, uris);
+
+    str_free (&uri);
+}
+
 GtkWidget* icon_view_create_icon_dpy (struct icon_view_t *icon_view, int scale)
 {
     // NOTE: At least one package (aptdaemon-data) provides animated icons in a
@@ -228,8 +245,18 @@ GtkWidget* icon_view_create_icon_dpy (struct icon_view_t *icon_view, int scale)
         }
 
         GtkWidget *hitbox = gtk_event_box_new ();
-        gtk_container_add (GTK_CONTAINER(hitbox), box);
         g_signal_connect (G_OBJECT(hitbox), "button-press-event", G_CALLBACK(on_image_clicked), img);
+
+        // Setup DnD of images
+        {
+            gtk_drag_source_set (hitbox, GDK_BUTTON1_MASK, NULL, 0, GDK_ACTION_COPY);
+            gtk_drag_source_add_uri_targets (hitbox);
+            GdkPixbuf *pixbuf = gtk_image_get_pixbuf (GTK_IMAGE(img->image));
+            gtk_drag_source_set_icon_pixbuf (hitbox, pixbuf);
+            g_signal_connect (G_OBJECT(hitbox), "drag-data-get", G_CALLBACK(on_drag_data_get), img);
+        }
+
+        gtk_container_add (GTK_CONTAINER(hitbox), box);
 
         gtk_container_add (GTK_CONTAINER(all_icons), hitbox);
 
@@ -325,7 +352,13 @@ GtkWidget* scale_selector_new (struct icon_view_t *icon_view)
 void on_icon_view_theme_changed (GtkComboBox *themes_combobox, gpointer user_data)
 {
     const char* theme_name = gtk_combo_box_get_active_id (themes_combobox);
-    app_set_selected_theme (&app, theme_name, app.selected_icon);
+    if (app.selected_theme_type == THEME_TYPE_ALL) {
+        app_set_selected_theme (&app, theme_name);
+        app_set_icon_view (&app, app.selected_icon);
+
+    } else {
+        app_set_normal_theme (&app, theme_name, app.selected_icon);
+    }
 }
 
 GtkWidget* draw_icon_view (struct icon_view_t *icon_view)
@@ -341,23 +374,30 @@ GtkWidget* draw_icon_view (struct icon_view_t *icon_view)
     gtk_widget_set_halign (icon_name_label, GTK_ALIGN_START);
     gtk_grid_attach (GTK_GRID(data_pane), icon_name_label, 0, 0, 1, 1);
 
-    GtkWidget *themes_combobox;
-    GtkWidget *theme_selector = labeled_combobox_new ("Theme:", &themes_combobox);
-    for (struct icon_theme_t *curr_theme = app.themes; curr_theme; curr_theme = curr_theme->next) {
-        if (g_hash_table_contains (curr_theme->icon_names, icon_view->icon_name)) {
-            combo_box_text_append_text_with_id (GTK_COMBO_BOX_TEXT(themes_combobox), curr_theme->name);
+    GtkWidget *icon_widgets = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 18);
+    GtkWidget *theme_selector = NULL;
+    if (app.selected_theme_type == THEME_TYPE_ALL || app.selected_theme_type == THEME_TYPE_NORMAL) {
+        GtkWidget *themes_combobox;
+        theme_selector = labeled_combobox_new ("Theme:", &themes_combobox);
+        for (struct icon_theme_t *curr_theme = app.themes; curr_theme; curr_theme = curr_theme->next) {
+            if (g_hash_table_contains (curr_theme->icon_names, icon_view->icon_name)) {
+                combo_box_text_append_text_with_id (GTK_COMBO_BOX_TEXT(themes_combobox), curr_theme->name);
+            }
         }
+
+        gtk_combo_box_set_active_id (GTK_COMBO_BOX(themes_combobox), app.selected_theme->name);
+        g_signal_connect (G_OBJECT(themes_combobox), "changed", G_CALLBACK (on_icon_view_theme_changed), NULL);
+        gtk_container_add (GTK_CONTAINER(icon_widgets), theme_selector);
     }
-    gtk_combo_box_set_active_id (GTK_COMBO_BOX(themes_combobox), app.selected_theme->name);
-    g_signal_connect (G_OBJECT(themes_combobox), "changed", G_CALLBACK (on_icon_view_theme_changed), NULL);
-    gtk_widget_set_halign (theme_selector, GTK_ALIGN_END);
-    gtk_widget_set_hexpand (theme_selector, TRUE);
 
     GtkWidget *scale_selector = scale_selector_new (icon_view);
 
-    GtkWidget *icon_widgets = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 18);
-    gtk_container_add (GTK_CONTAINER(icon_widgets), theme_selector);
+    GtkWidget *widget_to_align = theme_selector != NULL ? theme_selector : scale_selector;
+    gtk_widget_set_halign (widget_to_align, GTK_ALIGN_END);
+    gtk_widget_set_hexpand (widget_to_align, TRUE);
+
     gtk_container_add (GTK_CONTAINER(icon_widgets), scale_selector);
+
     gtk_grid_attach (GTK_GRID(data_pane), icon_widgets, 1, 0, 1, 1);
 
     gtk_grid_attach (GTK_GRID(data_pane),

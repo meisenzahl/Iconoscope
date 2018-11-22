@@ -2206,6 +2206,29 @@ bool path_exists (char *path)
     return retval;
 }
 
+bool dir_exists (char *path)
+{
+    bool retval = true;
+    char *dir_path = sh_expand (path, NULL);
+
+    struct stat st;
+    int status;
+    if ((status = stat(dir_path, &st)) == -1) {
+        retval = false;
+        if (errno != ENOENT) {
+            printf ("Error checking existance of %s: %s\n", path, strerror(errno));
+        }
+
+    } else {
+        if (!S_ISDIR(st.st_mode)) {
+            return false;
+        }
+    }
+
+    free (dir_path);
+    return retval;
+}
+
 // NOTE: Returns false if there was an error creating the directory.
 bool ensure_dir_exists (char *path)
 {
@@ -2275,6 +2298,83 @@ bool ensure_path_exists (const char *path)
 
     free (dir_path);
     return success;
+}
+
+bool read_dir (DIR *dirp, struct dirent **res)
+{
+    errno = 0;
+    *res = readdir (dirp);
+    if (*res == NULL) {
+        if (errno != 0) {
+            printf ("Error while reading directory: %s", strerror (errno));
+        }
+        return false;
+    }
+    return true;
+}
+
+////////////////////////////
+// Recursive folder iterator
+//
+// Usage:
+//  iterate_dir (path, callback_name, data);
+//
+// The function _callback_name_ will be called for each file under _path_. The
+// function iterate_dir_printf() is an example callback. To define a new
+// callback called my_cb use:
+//
+// ITERATE_DIR_CB (my_cb)
+// {
+//     // The pointer _data_ from iterate_dir will be passed here as data.
+//     ....
+// }
+//
+// TODO: Make a non-recursive version of this and maybe don't even use a
+// callback but use a macro that hides a while or for loop behind. Making code
+// much more readable, and not requiring closures.
+#define ITERATE_DIR_CB(name) void name(char *fname, bool is_dir, void *data)
+typedef ITERATE_DIR_CB(iterate_dir_cb_t);
+
+ITERATE_DIR_CB (iterate_dir_printf)
+{
+    printf ("%s\n", fname);
+}
+
+void iterate_dir_helper (string_t *path,  iterate_dir_cb_t *callback, void *data)
+{
+    int path_len = str_len (path);
+
+    struct stat st;
+    callback (str_data(path), true, data);
+    DIR *d = opendir (str_data(path));
+    struct dirent *entry_info;
+    while (read_dir (d, &entry_info)) {
+        if (entry_info->d_name[0] != '.') { // file is not hidden
+            str_put_c (path, path_len, entry_info->d_name);
+            if (stat(str_data(path), &st) == 0) {
+                if (S_ISREG(st.st_mode)) {
+                    callback (str_data(path), false, data);
+
+                } else if (S_ISDIR(st.st_mode)) {
+                    str_cat_c (path, "/");
+                    iterate_dir_helper (path, callback, data);
+                }
+            }
+        }
+    }
+    closedir (d);
+}
+
+void iterate_dir (char *path, iterate_dir_cb_t *callback, void *data)
+{
+    string_t path_str = str_new (path);
+    if (str_last (&path_str) != '/') {
+        str_cat_c (&path_str, "/");
+    }
+
+    iterate_dir_helper (&path_str, callback, data);
+
+    str_free (&path_str);
 }
 
 //////////////////////////////
